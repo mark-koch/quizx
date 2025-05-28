@@ -33,6 +33,7 @@ use SimpFunc::*;
 pub enum DecompFunc {
     BSS,
     BSSWithCats,
+    SpiderCut,
 }
 use DecompFunc::*;
 
@@ -138,6 +139,11 @@ impl<G: GraphLike> Decomposer<G> {
         self
     }
 
+    pub fn with_decomp(&mut self, decomp: DecompFunc) -> &mut Self {
+        self.decomp_func = decomp;
+        self
+    }
+
     pub fn use_cats(&mut self, b: bool) -> &mut Self {
         if b {
             self.decomp_func = BSSWithCats;
@@ -171,26 +177,7 @@ impl<G: GraphLike> Decomposer<G> {
     /// stack.
     pub fn decomp_top(&mut self) -> &mut Self {
         let (depth, g) = self.stack.pop_back().unwrap();
-        if self.decomp_func == BSSWithCats {
-            let cat_nodes = Decomposer::cat_ts(&g); //gadget_ts(&g);
-                                                    //println!("{:?}", gadget_nodes);
-                                                    //let nts = cat_nodes.iter().fold(0, |acc, &x| if g.phase(x).denom() == &4 { acc + 1 } else { acc });
-            if cat_nodes.len() > 3 {
-                // println!("using cat!");
-                return self.push_cat_decomp(depth + 1, &g, &cat_nodes);
-            }
-            let ts = Decomposer::first_ts(&g);
-            if ts.len() >= 5 {
-                return self.push_magic5_from_cat_decomp(depth + 1, &g, &ts[..5]);
-            }
-        }
-        let ts = if self.random_t {
-            Decomposer::random_ts(&g, &mut thread_rng())
-        } else {
-            Decomposer::first_ts(&g)
-        };
-        self.decomp_ts(depth, g, &ts);
-        self
+        self.select_and_push_decomp(g, depth)
     }
 
     /// Decompose until there are no T gates left
@@ -210,20 +197,7 @@ impl<G: GraphLike> Decomposer<G> {
                 self.stack.push_front((d, g));
                 break;
             } else {
-                if self.decomp_func == BSSWithCats {
-                    let cat_nodes = Decomposer::cat_ts(&g);
-
-                    if cat_nodes.len() > 3 {
-                        // println!("using cat!");
-                        return self.push_cat_decomp(depth + 1, &g, &cat_nodes);
-                    }
-                }
-                let ts = if self.random_t {
-                    Decomposer::random_ts(&g, &mut thread_rng())
-                } else {
-                    Decomposer::first_ts(&g)
-                };
-                self.decomp_ts(d, g, &ts);
+                self.select_and_push_decomp(g, d);
             }
         }
         self
@@ -243,6 +217,38 @@ impl<G: GraphLike> Decomposer<G> {
         )
     }
 
+    fn select_and_push_decomp(&mut self, g: G, depth: usize) -> &mut Self {
+        match self.decomp_func {
+            DecompFunc::BSS => {
+                let ts = self.pick_verts(&g, |v| g.phase(v).is_t(), 6);
+                self.decomp_ts(depth, g, &ts);
+            }
+            DecompFunc::BSSWithCats => {
+                let cat_nodes = Decomposer::cat_ts(&g);
+                if cat_nodes.len() > 3 {
+                    self.push_cat_decomp(depth + 1, &g, &cat_nodes);
+                } else {
+                    let ts = self.pick_verts(&g, |v| g.phase(v).is_t(), 6);
+                    if ts.len() >= 5 {
+                        self.push_magic5_from_cat_decomp(depth + 1, &g, &ts[..5]);
+                    } else {
+                        self.decomp_ts(depth, g, &ts);
+                    }
+                }
+            }
+            DecompFunc::SpiderCut => {
+                let vs = self.pick_verts(&g, |v| !g.phase(v).is_clifford(), 1);
+                if !vs.is_empty() {
+                    self.push_spider_cut_decomp(depth + 1, &g, &vs);
+                } else {
+                    // Otherwise, fall back to decomp_ts to handle the Clifford diagram
+                    self.decomp_ts(depth, g, &[]);
+                }
+            }
+        }
+        self
+    }
+
     pub fn decomp_ts(&mut self, depth: usize, g: G, ts: &[usize]) {
         if ts.len() == 6 {
             self.push_bss_decomp(depth + 1, &g, ts);
@@ -251,7 +257,8 @@ impl<G: GraphLike> Decomposer<G> {
         } else if !ts.is_empty() {
             self.push_single_decomp(depth + 1, &g, ts);
         } else {
-            // crate::simplify::full_simp(&mut g);
+            let mut g = g;
+            crate::simplify::full_simp(&mut g);
             self.scalar += g.scalar();
             self.nterms += 1;
             if g.inputs().is_empty() && g.outputs().is_empty() && g.num_vertices() != 0 {
@@ -265,7 +272,39 @@ impl<G: GraphLike> Decomposer<G> {
         }
     }
 
-    /// Pick the first <= 6 T gates from the given graph
+    /// Pick <= `max` spiders that satisfy the predicate from the given graph, choosen using the
+    /// configured strategy
+    pub fn pick_verts<P>(&self, g: &G, pred: P, max: usize) -> Vec<V>
+    where
+        P: Fn(V) -> bool,
+    {
+        if self.random_t {
+            Decomposer::random_verts(g, pred, max, &mut thread_rng())
+        } else {
+            Decomposer::first_verts(g, pred, max)
+        }
+    }
+
+    /// Pick the first <= `max` spiders that satisfy the predicate from the given graph
+    pub fn first_verts<P>(g: &G, pred: P, max: usize) -> Vec<V>
+    where
+        P: Fn(V) -> bool,
+    {
+        let mut t = vec![];
+
+        for v in g.vertices() {
+            if pred(v) {
+                t.push(v);
+            }
+            if t.len() == max {
+                break;
+            }
+        }
+
+        t
+    }
+
+    /// Pick the first <= `max` spiders that satisfy the predicate from the given graph
     pub fn first_ts(g: &G) -> Vec<V> {
         let mut t = vec![];
 
@@ -281,13 +320,16 @@ impl<G: GraphLike> Decomposer<G> {
         t
     }
 
-    /// Pick <= 6 T gates from the given graph, chosen at random
-    pub fn random_ts(g: &G, rng: &mut impl Rng) -> Vec<V> {
+    /// Pick <= `max` T gates that satisfy the predicate from the given graph, chosen at random
+    pub fn random_verts<P>(g: &G, pred: P, max: usize, rng: &mut impl Rng) -> Vec<V>
+    where
+        P: Fn(V) -> bool,
+    {
         // the graph g is assumed to contain no X spiders
-        let mut all_t: Vec<_> = g.vertices().filter(|&v| g.phase(v).is_t()).collect();
+        let mut all_t: Vec<_> = g.vertices().filter(|&v| pred(v)).collect();
         let mut t = vec![];
 
-        while t.len() < 6 && !all_t.is_empty() {
+        while t.len() < max && !all_t.is_empty() {
             let i = rng.gen_range(0..all_t.len());
             t.push(all_t.swap_remove(i));
         }
@@ -471,6 +513,18 @@ impl<G: GraphLike> Decomposer<G> {
         } else {
             panic!("this shouldn't be printed")
         }
+    }
+
+    fn push_spider_cut_decomp(&mut self, depth: usize, g: &G, verts: &[V]) -> &mut Self {
+        self.push_decomp(
+            &[
+                Decomposer::replace_spider_cut0,
+                Decomposer::replace_spider_cut1,
+            ],
+            depth,
+            g,
+            verts,
+        )
     }
 
     fn replace_cat6_0(g: &G, verts: &[V]) -> G {
@@ -704,6 +758,29 @@ impl<G: GraphLike> Decomposer<G> {
         g.add_to_phase(verts[0], Rational64::new(-1, 4));
         g
     }
+
+    fn replace_spider_cut0(g: &G, verts: &[V]) -> G {
+        let v = verts[0];
+        let degree = g.degree(v) as i32;
+        let mut g = g.clone();
+        g.remove_vertex(v);
+        g.scalar_mut().mul_sqrt2_pow(-degree);
+        g
+    }
+
+    fn replace_spider_cut1(g: &G, verts: &[V]) -> G {
+        let v = verts[0];
+        let degree = g.degree(v) as i32;
+        let mut g_copy = g.clone();
+        g_copy.remove_vertex(v);
+        for n in g.neighbors(v) {
+            g_copy.add_to_phase(n, 1);
+        }
+        let s = g_copy.scalar_mut();
+        s.mul_sqrt2_pow(-degree);
+        s.mul_phase(g.phase(v));
+        g_copy
+    }
 }
 
 #[cfg(test)]
@@ -711,6 +788,11 @@ mod tests {
     use super::*;
     use crate::tensor::*;
     use crate::vec_graph::Graph;
+    use approx::abs_diff_eq;
+    use itertools::Itertools;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use rstest::rstest;
 
     #[test]
     fn bss_scalars() {
@@ -952,5 +1034,35 @@ mod tests {
         d.with_full_simp().save(true).use_cats(true).decomp_all(); // this line panics
 
         assert_eq!(d.done.len(), 3);
+    }
+
+    #[rstest]
+    #[case(0, 5, 0.1)]
+    #[case(1, 5, 0.25)]
+    #[case(2, 5, 0.5)]
+    fn spider_cut(#[case] seed: u64, #[case] num_verts: usize, #[case] edge_prob: f64) {
+        // Construct random Erdős–Rényi graph
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut g = Graph::new();
+        let vs = (0..num_verts)
+            .map(|_| g.add_vertex_with_phase(VType::Z, Rational64::new(rng.gen_range(1..11), 5)))
+            .collect_vec();
+        for &v1 in &vs {
+            for &v2 in &vs[v1 + 1..] {
+                if rng.gen_bool(edge_prob) {
+                    g.add_edge_with_type(v1, v2, EType::H);
+                }
+            }
+        }
+
+        let mut d = Decomposer::new(&g);
+        d.with_simp(SimpFunc::CliffordSimp)
+            .with_decomp(DecompFunc::SpiderCut)
+            .decomp_all();
+
+        let t = g.to_tensorf();
+        println!("{}", t[[]]);
+        println!("{}", d.scalar);
+        assert!(abs_diff_eq!(t[[]], d.scalar));
     }
 }
