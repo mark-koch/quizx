@@ -138,6 +138,11 @@ impl Scalar4 {
             None
         }
     }
+
+    /// Returns the dyadic real represented by this scalar or `None` if the value is complex.
+    pub fn exact_real(&self) -> Option<Dyadic> {
+        self.0[1..].iter().all(|c| c.is_zero()).then(|| self.0[0])
+    }
 }
 
 impl Default for Scalar4 {
@@ -719,5 +724,13 @@ mod test {
             s.exact_phase_and_sqrt2_pow(),
             Some((Rational64::new(1, 2).into(), 1))
         );
+    }
+
+    #[rstest]
+    #[case(Scalar4::zero(), Some(Dyadic::zero()))]
+    #[case(10000.into(), Some(10000.into()))]
+    #[case(Scalar4::from_phase((1,2)), None)]
+    fn exact_real(#[case] scalar: Scalar4, #[case] expected: Option<Dyadic>) {
+        assert_eq!(scalar.exact_real(), expected);
     }
 }
